@@ -408,18 +408,34 @@ def _make_server_creators(handler, *, loop, ssl_context,
             uris.append(str(base_url.with_host(host).with_port(port)))
     return server_creations, uris
 
+class _AsyncContextManager:
+    def __init__(self, f):
+        self.f = f
 
-def run_app(app, *, host=None, port=None, path=None, sock=None,
+    def __call__(self, *args, **kwargs):
+        self.args, self.kwargs = args, kwargs
+        return self
+
+    async def __aenter__(self):
+        self.it = self.f(*self.args, **self.kwargs).__aiter__()
+        v = await self.it.__anext__()
+        return v
+
+    async def __aexit__(self, exc_type, exc, tb):
+        try:
+            await self.it.__anext__()
+        except StopAsyncIteration: pass
+
+@_AsyncContextManager
+async def run_app_context(app, *, host=None, port=None, path=None, sock=None,
             shutdown_timeout=60.0, ssl_context=None,
             print=print, backlog=128, access_log_format=None,
             access_log=access_logger, handle_signals=True, loop=None):
     """Run an app locally"""
-    user_supplied_loop = loop is not None
-    if loop is None:
-        loop = asyncio.get_event_loop()
+    assert loop
 
     app._set_loop(loop)
-    loop.run_until_complete(app.startup())
+    await app.startup()
 
     try:
         make_handler_kwargs = dict()
@@ -433,9 +449,7 @@ def run_app(app, *, host=None, port=None, path=None, sock=None,
             loop=loop, ssl_context=ssl_context,
             host=host, port=port, path=path, sock=sock,
             backlog=backlog)
-        servers = loop.run_until_complete(
-            asyncio.gather(*server_creations, loop=loop)
-        )
+        servers = await asyncio.gather(*server_creations, loop=loop)
 
         if handle_signals:
             try:
@@ -448,7 +462,7 @@ def run_app(app, *, host=None, port=None, path=None, sock=None,
         try:
             print("======== Running on {} ========\n"
                   "(Press CTRL+C to quit)".format(', '.join(uris)))
-            loop.run_forever()
+            yield app, uris
         except (GracefulExit, KeyboardInterrupt):  # pragma: no cover
             pass
         finally:
@@ -456,15 +470,38 @@ def run_app(app, *, host=None, port=None, path=None, sock=None,
             for srv in servers:
                 srv.close()
                 server_closures.append(srv.wait_closed())
-            loop.run_until_complete(
-                asyncio.gather(*server_closures, loop=loop))
-            loop.run_until_complete(app.shutdown())
-            loop.run_until_complete(handler.shutdown(shutdown_timeout))
+            await asyncio.gather(*server_closures, loop=loop)
+            await app.shutdown()
+            await handler.shutdown(shutdown_timeout)
     finally:
-        loop.run_until_complete(app.cleanup())
+        await app.cleanup()
+
+async def _run_app(future, app, *, host=None, port=None, path=None, sock=None,
+            shutdown_timeout=60.0, ssl_context=None,
+            print=print, backlog=128, access_log_format=None,
+            access_log=access_logger, handle_signals=True, loop=None):
+    assert loop
+    async with run_app_context(app, host, port, path, sock,
+            shutdown_timeout, ssl_context,
+            print, backlog, access_log_format,
+            access_log, handle_signals, loop) as (app, uris):
+        await future
+
+def run_app(app, *, host=None, port=None, path=None, sock=None,
+            shutdown_timeout=60.0, ssl_context=None,
+            print=print, backlog=128, access_log_format=None,
+            access_log=access_logger, handle_signals=True, loop=None):
+    """Run an app locally"""
+    user_supplied_loop = loop is not None
+    if loop is None:
+        loop = asyncio.get_event_loop()
+    future = loop.create_future()
+    loop.run_until_complete(_run_app(app, host, port, path, sock,
+            shutdown_timeout, ssl_context,
+            print, backlog, access_log_format,
+            access_log, handle_signals, loop))
     if not user_supplied_loop:
         loop.close()
-
 
 def main(argv):
     arg_parser = ArgumentParser(
